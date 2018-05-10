@@ -19,7 +19,7 @@ namespace GitImporter
     {
         public static TraceSource Logger = new TraceSource("GitImporter", SourceLevels.All);
 
-        static void Main(string[] args)
+        static int Main(string[] args)
         {
             Console.Error.WriteLine("GitImporter called with {0} arguments :", args.Length);
             foreach (string arg in args)
@@ -27,11 +27,11 @@ namespace GitImporter
             Logger.TraceData(TraceEventType.Information, 0, string.Format("GitImporter called with {0} arguments : {1}", args.Length, string.Join(" ", args)));
             var importerArguments = new ImporterArguments();
             if (!CommandLine.Parser.ParseArgumentsWithUsage(args, importerArguments))
-                return;
+                return 1;
             if (!importerArguments.CheckArguments())
             {
                 Console.Error.WriteLine(CommandLine.Parser.ArgumentsUsage(typeof(ImporterArguments)));
-                return;
+                return 1;
             }
 
             try
@@ -41,7 +41,7 @@ namespace GitImporter
 
                 if (!string.IsNullOrEmpty(importerArguments.FetchFileContent))
                 {
-                    using (var gitWriter = new GitWriter(importerArguments.ClearcaseRoot, importerArguments.NoFileContent, importerArguments.Labels))
+                    using (var gitWriter = new GitWriter(importerArguments.ClearcaseRoot, importerArguments.NoFileContent, importerArguments.Labels, importerArguments.Roots))
                     {
                         if (File.Exists(importerArguments.ThirdpartyConfig))
                         {
@@ -53,7 +53,7 @@ namespace GitImporter
                         gitWriter.WriteFile(importerArguments.FetchFileContent);
                     }
                     Logger.TraceData(TraceEventType.Stop | TraceEventType.Information, 0, "Stop program");
-                    return;
+                    return 0;
                 }
                 if (importerArguments.LoadVobDB != null && importerArguments.LoadVobDB.Length > 0)
                 {
@@ -113,13 +113,14 @@ namespace GitImporter
                         historyBuilder = new HistoryBuilder(vobDB);
 
                     // command-line arguments take precedence
-                    historyBuilder.SetRoots(importerArguments.Roots);
+                    historyBuilder.SetRoots(importerArguments.ClearcaseRoot, importerArguments.Roots);
                     historyBuilder.SetBranchFilters(importerArguments.Branches);
 
                     var changeSets = historyBuilder.Build(newVersions);
                     var branchRename = historyBuilder.GetBranchRename();
+                    var labels = historyBuilder.GetLabels();
 
-                    using (var gitWriter = new GitWriter(importerArguments.ClearcaseRoot, importerArguments.NoFileContent, importerArguments.Labels, branchRename))
+                    using (var gitWriter = new GitWriter(importerArguments.ClearcaseRoot, importerArguments.NoFileContent, importerArguments.Labels, importerArguments.Roots, branchRename))
                     {
                         if (File.Exists(importerArguments.IgnoreFile))
                             gitWriter.InitialFiles.Add(new Tuple<string, string>(".gitignore", importerArguments.IgnoreFile));
@@ -131,7 +132,7 @@ namespace GitImporter
                             gitWriter.PostWritingHooks.AddRange(hook.PostWritingHooks);
                             gitWriter.InitialFiles.Add(new Tuple<string, string>(".gitmodules", hook.ModulesFile));
                         }
-                        gitWriter.WriteChangeSets(changeSets);
+                        gitWriter.WriteChangeSets(changeSets, labels, vobDB.LabelMetas);
                     }
 
                     if (!string.IsNullOrWhiteSpace(importerArguments.History))
@@ -143,11 +144,13 @@ namespace GitImporter
                         Logger.TraceData(TraceEventType.Information, 0, "History data successfully saved in " + importerArguments.History);
                     }
                 }
+                return 0;
             }
             catch (Exception ex)
             {
                 Logger.TraceData(TraceEventType.Critical, 0, "Exception during import : " + ex);
                 Console.Error.WriteLine("Exception during import : " + ex);
+                return 1;
             }
             finally
             {

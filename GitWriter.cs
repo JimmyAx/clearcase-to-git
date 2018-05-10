@@ -46,13 +46,15 @@ namespace GitImporter
         private bool _isIncremental;
         private readonly HashSet<string> _startedBranches = new HashSet<string>();
         private readonly Dictionary<string, string> _branchRename;
+        private readonly List<String> Roots;
+        private List<String> RelativeRoots;
 
         public List<Tuple<string, string>> InitialFiles { get; private set; }
 
         public List<PreWritingHook> PreWritingHooks { get; private set; }
         public List<PostWritingHook> PostWritingHooks { get; private set; }
 
-        public GitWriter(string clearcaseRoot, bool doNotIncludeFileContent, IEnumerable<string> labels,
+        public GitWriter(string clearcaseRoot, bool doNotIncludeFileContent, IEnumerable<string> labels, string[] roots,
             Dictionary<string, string> branchRename = null)
         {
             _doNotIncludeFileContent = doNotIncludeFileContent;
@@ -60,23 +62,35 @@ namespace GitImporter
             InitialFiles = new List<Tuple<string, string>>();
             PreWritingHooks = new List<PreWritingHook>();
             PostWritingHooks = new List<PostWritingHook>();
+            Roots = new List<string>(roots).Select(r => r.Replace("\\", "/")).ToList();
+            RelativeRoots = roots.Where(r => r != ".").Select(r => {
+                if (r.StartsWith(clearcaseRoot)) {
+                    r = r.Substring(clearcaseRoot.Length);
+                }
+                if (r.StartsWith("\\"))
+                {
+                    r = r.Substring(1);
+                }
+                return r.Replace("\\", "/");
+            }).ToList();
 
             if (_doNotIncludeFileContent)
                 return;
             _cleartool = new Cleartool(clearcaseRoot, new LabelFilter(labels));
         }
 
-        public void WriteChangeSets(IList<ChangeSet> changeSets)
+        public void WriteChangeSets(IList<ChangeSet> changeSets, Dictionary<string, LabelInfo> labels, Dictionary<string, LabelMeta> labelMetas)
         {
             int total = changeSets.Count;
             int n = 0;
             Logger.TraceData(TraceEventType.Start | TraceEventType.Information, (int)TraceId.ApplyChangeSet, "Start writing " + total + " change sets");
 
-            _isIncremental = changeSets.Count > 0 && changeSets[0].Id > 1;
+            _isIncremental = false; // changeSets.Count > 0 && changeSets[0].Id > 10;
             int checkpointFrequency = ComputeFrequency(total, 10);
             int reportFrequency = ComputeFrequency(total, 1000);
 
             _initialFilesAdded = InitialFiles.Count == 0; // already "added" if not specified
+            var branchChangeSet = changeSets.GroupBy(c => c.Branch).ToDictionary(x => x.Key, x => x.ToList());
             foreach (var changeSet in changeSets)
             {
                 n++;
@@ -86,7 +100,7 @@ namespace GitImporter
                     _writer.Write("progress Writing change set " + n + " of " + total + "\n\n");
 
                 Logger.TraceData(TraceEventType.Start | TraceEventType.Verbose, (int)TraceId.ApplyChangeSet, "Start writing change set", n);
-                WriteChangeSet(changeSet);
+                WriteChangeSet(changeSet, branchChangeSet, labels, labelMetas);
                 Logger.TraceData(TraceEventType.Stop | TraceEventType.Verbose, (int)TraceId.ApplyChangeSet, "Stop writing change set", n);
             }
 
@@ -102,7 +116,7 @@ namespace GitImporter
             return frequency;
         }
 
-        private void WriteChangeSet(ChangeSet changeSet)
+        private void WriteChangeSet(ChangeSet changeSet, Dictionary<string, List<ChangeSet>> branches, Dictionary<string, LabelInfo> labels, Dictionary<string, LabelMeta> labelMetas)
         {
             if (changeSet.IsEmpty)
             {
@@ -110,86 +124,115 @@ namespace GitImporter
                 return;
             }
 
-            string branchName = changeSet.Branch == "main" ? "master" : MaybeRenamed(changeSet.Branch);
-            _writer.Write("commit refs/heads/" + branchName + "\n");
-            _writer.Write("mark :" + changeSet.Id + "\n");
-            _writer.Write("committer " + changeSet.AuthorName + " <" + changeSet.AuthorLogin + "> " + (changeSet.StartTime - _epoch).TotalSeconds + " +0200\n");
-            InlineString(changeSet.GetComment());
-            if (changeSet.BranchingPoint != null)
+            bool writeCommit = true;
+            if (changeSet.IsEmptyGitCommit)
             {
-                _writer.Write("from :" + changeSet.BranchingPoint.Id + "\n");
-                _startedBranches.Add(branchName);
+                Logger.TraceData(TraceEventType.Information, (int)TraceId.ApplyChangeSet, "Only writing the tags (if any) for " + changeSet);
+                writeCommit = false;
             }
-            else if (_isIncremental && !_startedBranches.Contains(branchName))
-            {
-                _writer.Write("from refs/heads/" + branchName + "^0\n");
-                _startedBranches.Add(branchName);
-            }
-            foreach (var merge in changeSet.Merges)
-                _writer.Write("merge :" + merge.Id + "\n");
 
-            if (!_initialFilesAdded && branchName == "master")
+            string branchName = changeSet.Branch == "main" ? "master" : MaybeRenamed(changeSet.Branch);
+            if (writeCommit)
             {
-                _initialFilesAdded = true;
-                foreach (var initialFile in InitialFiles)
+                _writer.Write("commit refs/heads/" + branchName + "\n");
+                _writer.Write("mark :" + changeSet.Id + "\n");
+                _writer.Write("committer " + changeSet.AuthorName + " <" + changeSet.AuthorLogin + "> " + (changeSet.StartTime - _epoch).TotalSeconds + " +0200\n");
+                _writer.Write("# " + changeSet.StartTime + "\n");
+                InlineString(changeSet.GetComment());
+                if (changeSet.BranchingPoint != null)
                 {
-                    var fileInfo = new FileInfo(initialFile.Item2);
-                    if (fileInfo.Exists)
+                    _writer.Write("from :" + changeSet.BranchingPoint.Id + "\n");
+                    _startedBranches.Add(branchName);
+                }
+                else if (_isIncremental && !_startedBranches.Contains(branchName))
+                {
+                    _writer.Write("from refs/heads/" + branchName + "^0\n");
+                    _startedBranches.Add(branchName);
+                }
+                foreach (var merge in changeSet.Merges)
+                    _writer.Write("merge :" + merge.Id + "\n");
+
+                if (!_initialFilesAdded && branchName == "master")
+                {
+                    _initialFilesAdded = true;
+                    foreach (var initialFile in InitialFiles)
                     {
-                        _writer.Write("M 644 inline " + initialFile.Item1 + "\ndata " + fileInfo.Length + "\n");
-                        // Flush() before using BaseStream directly
-                        _writer.Flush();
-                        using (var s = new FileStream(initialFile.Item2, FileMode.Open, FileAccess.Read))
-                            s.CopyTo(_writer.BaseStream);
+                        var fileInfo = new FileInfo(initialFile.Item2);
+                        if (fileInfo.Exists)
+                        {
+                            _writer.Write("M 644 inline " + initialFile.Item1 + "\n");
+                            InlineString(File.ReadAllText(initialFile.Item2));
+                        }
                     }
                 }
-            }
 
-            // order is significant : we must Rename and Copy files before (maybe) deleting their directory
-            foreach (var pair in changeSet.Renamed)
-                _writer.Write("R \"" + RemoveDotRoot(pair.Item1) + "\" \"" + RemoveDotRoot(pair.Item2) + "\"\n");
-            foreach (var pair in changeSet.Copied)
-                _writer.Write("C \"" + RemoveDotRoot(pair.Item1) + "\" \"" + RemoveDotRoot(pair.Item2) + "\"\n");
-            foreach (var removed in changeSet.Removed)
-                _writer.Write("D " + RemoveDotRoot(removed) + "\n");
+                // order is significant : we must Rename and Copy files before (maybe) deleting their directory
+                foreach (var pair in changeSet.Renamed)
+                    _writer.Write("R \"" + RemoveDotRoot(pair.Item1) + "\" \"" + RemoveDotRoot(pair.Item2) + "\"\n");
+                foreach (var pair in changeSet.Copied)
+                    _writer.Write("C \"" + RemoveDotRoot(pair.Item1) + "\" \"" + RemoveDotRoot(pair.Item2) + "\"\n");
+                foreach (var removed in changeSet.Removed)
+                    _writer.Write("D " + RemoveDotRoot(removed) + "\n");
 
-            foreach (var symLink in changeSet.SymLinks)
-            {
-                _writer.Write("M 120000 inline " + RemoveDotRoot(symLink.Item1) + "\n");
-                InlineString(RemoveDotRoot(symLink.Item2));
-            }
-
-            foreach (var namedVersion in changeSet.Versions)
-            {
-                if (namedVersion.Version is DirectoryVersion || namedVersion.Names.Count == 0)
-                    continue;
-
-                bool isEmptyFile = namedVersion.Version.VersionNumber == 0 && namedVersion.Version.Branch.BranchName == "main";
-
-                if (_doNotIncludeFileContent || isEmptyFile)
+                foreach (var symLink in changeSet.SymLinks)
                 {
-                    foreach (string name in namedVersion.Names.Select(RemoveDotRoot))
-                        if (isEmptyFile)
-                            _writer.Write("M 644 inline " + name + "\ndata 0\n\n");
-                        else
-                        {
-                            // don't use InlineString here, so that /FetchFileContent is easy to implement
-                            _writer.Write("M 644 inline " + name + "\ndata <<EOF\n" + namedVersion.Version + "#" + namedVersion.Version.Element.Oid + "\nEOF\n\n");
-                            // also include name in a comment for hooks in /FetchFileContent
-                            _writer.Write("#" + name + "\n");
-                        }
-                    continue;
+                    _writer.Write("M 120000 inline " + RemoveDotRoot(symLink.Item1) + "\n");
+                    InlineString(RemoveDotRoot(symLink.Item2));
                 }
 
-                InlineClearcaseFileVersion(namedVersion.Version.Element.Name, namedVersion.Version.Element.Oid, namedVersion.Version.VersionPath, namedVersion.Names.Select(RemoveDotRoot), true);
+                foreach (var namedVersion in changeSet.Versions)
+                {
+                    if (namedVersion.Version is DirectoryVersion || namedVersion.Names.Count == 0)
+                        continue;
+
+                    bool isEmptyFile = namedVersion.Version.VersionNumber == 0 && namedVersion.Version.Branch.BranchName == "main";
+
+                    if (_doNotIncludeFileContent || isEmptyFile)
+                    {
+                        foreach (string name in namedVersion.Names.Select(RemoveDotRoot))
+                            if (isEmptyFile)
+                                _writer.Write("M 644 inline " + name + "\ndata 0\n\n");
+                            else
+                            {
+                                // don't use InlineString here, so that /FetchFileContent is easy to implement
+                                _writer.Write("M 644 inline " + name + "\ndata <<EOF\n" + namedVersion.Version + "#" + namedVersion.Version.Element.Oid + "\nEOF\n\n");
+                                // also include name in a comment for hooks in /FetchFileContent
+                                _writer.Write("#" + name + "\n");
+                            }
+                        continue;
+                    }
+
+                    InlineClearcaseFileVersion(namedVersion.Version.Element.Name, namedVersion.Version.Element.Oid, namedVersion.Version.VersionPath, namedVersion.Names.Select(RemoveDotRoot), true);
+                }
             }
 
             foreach (var label in changeSet.Labels)
             {
                 _writer.Write("tag " + label + "\n");
                 _writer.Write("from :" + changeSet.Id + "\n");
-                _writer.Write("tagger Unknown <unknown> " + (changeSet.StartTime - _epoch).TotalSeconds + " +0200\n");
-                _writer.Write("data 0\n\n");
+                LabelMeta meta = labelMetas[label];
+
+                var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                _writer.Write("tagger " + meta.AuthorName + " <" + meta.AuthorLogin + "> " + (meta.Created - epoch).TotalSeconds + " +0000\n"); // var +0200
+
+                List<Tuple<ElementVersion, ElementVersion>> possibleBroken = labels[label].PossiblyBroken.Where(
+                    t => null != RelativeRoots.Find(
+                        r => RemoveDotRoot(t.Item1.ToString().Replace("\\", "/") + "/").StartsWith(r + "/")
+                    )).ToList();
+                if (possibleBroken.Count > 0)
+                {
+                    Logger.TraceData(TraceEventType.Warning, (int)TraceId.ApplyChangeSet, "Label " + label + " was inconsistent when writing it. Count", possibleBroken.Count);
+                    string msg = "Warning! This tag could be incorrect.\nGot an unexpected result, though it could still be correct.\n\n";
+                    foreach (Tuple<ElementVersion, ElementVersion> items in possibleBroken)
+                    {
+                        msg += "Expected \"" + RemoveDotRoot(items.Item1.ToString()) + "\", but got " + (items.Item2 == null ? "nothing" : "\"" + RemoveDotRoot(items.Item2.ToString()) + "\"") + ".\n";
+                    }
+                    InlineString(msg);
+                }
+                else
+                {
+                    _writer.Write("data 0\n\n");
+                }
             }
         }
 
@@ -209,8 +252,17 @@ namespace GitImporter
             _writer.Write("\n");
         }
 
-        private static string RemoveDotRoot(string path)
+        private string RemoveDotRoot(string path)
         {
+            foreach (string root in Roots) {
+                if (path.StartsWith(root)) {
+                    path = path.Substring(root.Length);
+                    break;
+                }
+            }
+            if (path.StartsWith("/")) {
+                path = path.Substring(1);
+            }
             return path.StartsWith("./") ? path.Substring(2) : path;
         }
 

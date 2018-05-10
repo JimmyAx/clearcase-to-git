@@ -17,9 +17,9 @@ namespace GitImporter
         public string ElementsFile;
         [Argument(ArgumentType.AtMostOnce, HelpText = "File listing individual versions to import.")]
         public string VersionsFile;
-        [Argument(ArgumentType.MultipleUnique, HelpText = "Roots : directory elements whose parents are not imported.", DefaultValue = new[] { "." })]
+        [Argument(ArgumentType.MultipleUnique, HelpText = "Roots : directory elements whose parents are not imported.", DefaultValue = new string[0])]
         public string[] Roots;
-        [Argument(ArgumentType.MultipleUnique, HelpText = "Branches to import (may be a regular expression).", DefaultValue = new[] { "^PROD\\d+\\.\\d+" })]
+        [Argument(ArgumentType.MultipleUnique, HelpText = "Branches to import (may be a regular expression).", DefaultValue = new[] { ".*" })]
         public string[] Branches;
         [Argument(ArgumentType.MultipleUnique, HelpText = "Labels to import (may be a regular expression, or NONE).", DefaultValue = new[] { ".*" })]
         public string[] Labels;
@@ -35,7 +35,7 @@ namespace GitImporter
         public string FetchFileContent;
         [Argument(ArgumentType.AtMostOnce, HelpText = "File that will be added as .gitignore at the repo root.")]
         public string IgnoreFile;
-        [Argument(ArgumentType.AtMostOnce, HelpText = "Configuration file describing how to handle thirdparties as submodules.", DefaultValue = "thirdparty.config")]
+        [Argument(ArgumentType.AtMostOnce, HelpText = "Configuration file describing how to handle thirdparties as submodules.")]
         public string ThirdpartyConfig;
         [DefaultArgument(ArgumentType.MultipleUnique, HelpText = "Export files generated using clearexport. Each file is supposed to be directly in the working directory, but there may be a prefix that means a path from the main clearcase root.")]
         public string[] ExportFiles = new string[0];
@@ -59,16 +59,25 @@ namespace GitImporter
                 Console.Error.WriteLine("Either [FetchFileContent], [LoadVobDB] or [at least one from DirectoriesFile, ElementsFile and VersionsFile (and optionally ExportFiles)] must be provided");
                 return false;
             }
-            if (!string.IsNullOrEmpty(FetchFileContent) && ((LoadVobDB != null && LoadVobDB.Length > 0) || !string.IsNullOrEmpty(SaveVobDB) ||
+            if (!string.IsNullOrEmpty(FetchFileContent) && ((LoadVobDB != null && LoadVobDB.Length > 0) || !string.IsNullOrEmpty(SaveVobDB) || Roots.Length == 0 ||
                 NoFileContent || !string.IsNullOrEmpty(DirectoriesFile) || !string.IsNullOrEmpty(ElementsFile) || !string.IsNullOrEmpty(VersionsFile) || ExportFiles.Length > 0))
             {
-                Console.Error.WriteLine("FetchFileContent must be used with ClearcaseRoot and no other option");
+                Console.Error.WriteLine("FetchFileContent must be used with ClearcaseRoot, Root and no other option");
                 return false;
             }
             DateTime d;
             if (!string.IsNullOrEmpty(OriginDate) && !DateTime.TryParse(OriginDate, out d))
             {
                 Console.Error.WriteLine("OriginDate must be parsable as a DateTime");
+                return false;
+            }
+            if (Roots.Length == 0 && (
+                (LoadVobDB != null && LoadVobDB.Length > 0) || 
+                !string.IsNullOrEmpty(FetchFileContent) ||
+                !string.IsNullOrEmpty(History)
+                )) 
+            {
+                Console.Error.WriteLine("Roots must be specified");
                 return false;
             }
 

@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Text.RegularExpressions;
 using ProtoBuf;
 
 namespace GitImporter
@@ -56,6 +57,12 @@ namespace GitImporter
         private readonly Dictionary<string, ChangeSet> _branchTips = new Dictionary<string, ChangeSet>();
         [ProtoMember(8)]
         private Dictionary<string, int> _rawBranchTips;
+        [ProtoMember(9)]
+        private string _clearcaseRoot;
+        private List<String> RelativeRoots;
+        private Dictionary<string, LabelInfo> _allLabels;
+        private Dictionary<string, LabelMeta> _labelMetas;
+
 
         /// <summary>
         /// For use by protobuf
@@ -67,6 +74,12 @@ namespace GitImporter
         public HistoryBuilder(VobDB vobDB)
         {
             _rawHistoryBuilder = new RawHistoryBuilder(vobDB);
+            _labelMetas = vobDB.LabelMetas;
+        }
+
+        public Dictionary<string, LabelInfo> GetLabels()
+        {
+            return _allLabels;
         }
 
         public void SetBranchFilters(string[] branches)
@@ -75,17 +88,74 @@ namespace GitImporter
             _rawHistoryBuilder.SetBranchFilters(branches);
         }
 
-        public void SetRoots(IEnumerable<string> roots)
+        public void SetRoots(string clearcaseRoot, IEnumerable<string> roots)
         {
             _roots.Clear();
             // always need "." as root
             _roots.Add(".");
             foreach (var root in roots)
                 _roots.Add(root);
+            _clearcaseRoot = clearcaseRoot;
+
+            RelativeRoots = roots.Where(r => r != ".").Select(r => {
+                if (r.StartsWith(clearcaseRoot)) {
+                    r = r.Substring(clearcaseRoot.Length);
+                }
+                if (r.StartsWith("\\"))
+                {
+                    r = r.Substring(1);
+                }
+                return r.Replace("\\", "/");
+            }).ToList();
+        }
+
+        private string RemoveDotRoot(string path)
+        {
+            string ClearcaseRoot = _clearcaseRoot.Replace("\\", "/");
+            if (path.StartsWith(ClearcaseRoot))
+            {
+                path = path.Substring(ClearcaseRoot.Length);
+            }
+            if (path.StartsWith("/")) {
+                path = path.Substring(1);
+            }
+            return path.StartsWith("./") ? path.Substring(2) : path;
+        }
+
+        private bool insideRoot(Element element)
+        {
+            string ClearcaseRoot = _clearcaseRoot.Replace("\\", "/");
+            var name = element.Name.Replace("\\", "/");
+            string normalizedName;
+            if (name.StartsWith(ClearcaseRoot + "/.@@/main/"))
+            {
+                // hidden. take special care
+                name = name.Substring((ClearcaseRoot + "/.@@/main/").Length);
+                var match = Regex.Match(name, "([0-9]+?)/([^0-9/]+)");
+                if (!match.Success)
+                {
+                    throw new Exception("Failed find version for " + element.Name);
+                }
+                normalizedName = match.Groups[2].Value + "/";
+            }
+            else
+            {
+                // visible. nothing special here
+                normalizedName = RemoveDotRoot(name);
+            }
+            return null != RelativeRoots.Find(
+                r =>  {
+                    Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet, "Comparing in history", normalizedName, "vs", r);
+                    return normalizedName == "." || normalizedName == r || normalizedName.StartsWith(r + "/") || normalizedName.StartsWith(r + "@@/");
+                }
+            );
         }
 
         public IList<ChangeSet> Build(List<ElementVersion> newVersions)
         {
+            _rawHistoryBuilder.SetClearcaseRoot(_clearcaseRoot);
+            _rawHistoryBuilder.SetRoots(_roots);
+            _rawHistoryBuilder.SetRelativeRoots(RelativeRoots);
             _flattenChangeSets = _rawHistoryBuilder.Build(newVersions);
             if (_globalBranches != null)
             {
@@ -102,7 +172,106 @@ namespace GitImporter
             else
                 _globalBranches = _rawHistoryBuilder.GlobalBranches;
             _labels = _rawHistoryBuilder.Labels;
-            return ProcessElementNames();
+            _allLabels = new Dictionary<string, LabelInfo>(_labels);
+            List<ChangeSet> result = ProcessElementNames();
+            return CleanupHistory(result);
+        }
+
+        private List<ChangeSet> CleanupHistory(List<ChangeSet> history)
+        {
+            Logger.TraceData(TraceEventType.Information, (int)TraceId.ApplyChangeSet, "Before cleaning history we got", history.Count, "entries");
+            var branchChangeSet = history.GroupBy(c => c.Branch).ToDictionary(x => x.Key, x => x.ToList());
+            List<ChangeSet> toRemove = new List<ChangeSet>();
+            foreach (ChangeSet changeSet in history) {
+                if (changeSet.IsUselessGitCommit)
+                {
+                    Logger.TraceData(TraceEventType.Verbose, (int)TraceId.ApplyChangeSet, "Will drop changeset because it's useless", changeSet);
+                    toRemove.Add(changeSet);
+                    ReassignBranchingPoint(changeSet, branchChangeSet);
+                    continue;
+                }
+                if (changeSet.IsEmptyGitCommit)
+                {
+                    // move the tags to a non-empty commit.
+                    ChangeSet labelPoint = FindNonEmptyChangeSet(changeSet, branchChangeSet, toRemove);
+                    if (labelPoint == null)
+                    {
+                        // drop any labels because we can't attach them anywhere...
+                        if (changeSet.Labels.Count > 0)
+                        {
+                            Logger.TraceData(TraceEventType.Warning, (int)TraceId.ApplyChangeSet, "Dropping labels because we couldn't move them to a non-empty commit", string.Join(" ", changeSet.Labels.ToArray()));
+                        }
+                    }
+                    else
+                    {
+                        labelPoint.Labels.AddRange(changeSet.Labels);
+                    }
+                    ReassignBranchingPoint(changeSet, branchChangeSet);
+                    Logger.TraceData(TraceEventType.Information, (int)TraceId.ApplyChangeSet, "Will drop changeset because it's empty (tags got moved)", changeSet);
+                    toRemove.Add(changeSet);
+                    continue;
+                }
+                if (changeSet.BranchingPoint != null)
+                {
+                    // might have been removed so search for a new one
+                    changeSet.BranchingPoint = FindNonEmptyChangeSet(changeSet.BranchingPoint, branchChangeSet, toRemove);
+                }
+            }
+            foreach (ChangeSet changeSet in toRemove) {
+                history.Remove(changeSet);
+            }
+            Logger.TraceData(TraceEventType.Information, (int)TraceId.ApplyChangeSet, "After cleaning history we got", history.Count, "entries");
+            return history;
+        }
+
+        private void ReassignBranchingPoint(ChangeSet newBranch, Dictionary<string, List<ChangeSet>> branches)
+        {
+            if (newBranch.BranchingPoint == null || newBranch.Branch == "master")
+            {
+                return;
+            }
+            int index = branches[newBranch.Branch].IndexOf(newBranch);
+            if (index < 0)
+            {
+                throw new Exception("Didn't find " + newBranch);
+            }
+            index++;
+            if (index < branches[newBranch.Branch].Count)
+            {
+                branches[newBranch.Branch][index].BranchingPoint = newBranch.BranchingPoint;
+            }
+        }
+
+        private ChangeSet PreviousInBranch(ChangeSet changeSet, Dictionary<string, List<ChangeSet>> branches)
+        {
+            int index = branches[changeSet.Branch].IndexOf(changeSet);
+            if (index < 0)
+            {
+                throw new Exception("Didn't find " + changeSet);
+            }
+            index--;
+            return index < 0 ? null : branches[changeSet.Branch][index];
+        }
+
+        private ChangeSet FindNonEmptyChangeSet(ChangeSet labelPoint, Dictionary<string, List<ChangeSet>> branches, List<ChangeSet> toRemove)
+        {
+            while (labelPoint.IsEmptyGitCommit || toRemove.Contains(labelPoint))
+            {
+                ChangeSet previous = PreviousInBranch(labelPoint, branches);
+                if (previous == null)
+                {
+                    if (labelPoint.BranchingPoint == null)
+                            return null;
+                    // we started a new branch with a tag.
+                    // We still want this tag as non-interesting have been filtered out.
+                    // Move it up to the branching point and keep on going...
+                    Logger.TraceData(TraceEventType.Information, (int)TraceId.ApplyChangeSet, "Going to parent branch", labelPoint.BranchingPoint.Branch, "for", labelPoint, "with tags", string.Join(" ", labelPoint.Labels.ToArray()));
+                    labelPoint = labelPoint.BranchingPoint;
+                    continue;
+                }
+                labelPoint = previous;
+            }
+            return labelPoint;
         }
 
         private List<ChangeSet> ProcessElementNames()
@@ -151,6 +320,7 @@ namespace GitImporter
                 bool isNewBranch = !_startedBranches.ContainsKey(changeSet.Branch);
                 if (isNewBranch)
                 {
+                    // branch could start without branching from main
                     if (changeSet.Branch != "main")
                     {
                         string parentBranch = _globalBranches[changeSet.Branch];
@@ -160,10 +330,32 @@ namespace GitImporter
                         {
                             toStart = null;
                             string currentParent = parentBranch;
+                            // branch did not start has no parent so we must abort if we reach it
                             while (!_startedBranches.ContainsKey(currentParent))
                             {
+                                if (currentParent == "main")
+                                    // main was not started! this branch spawned from somewhere else
+                                    break;
                                 toStart = currentParent;
                                 currentParent = _globalBranches[currentParent];
+                            }
+                            if (currentParent == "main" && !_startedBranches.ContainsKey(currentParent))
+                            {
+                                Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet,
+                                     "main has not been started. Creating dummy commit.");
+                                // main branch has not been started
+                                // that means this branch did not start from the main branch, but rather on it's own branch
+                                // insert an empty main commit and continue
+                                var mainBranch = new ChangeSet(changeSet.AuthorName, changeSet.AuthorLogin, toStart, changeSet.FinishTime);
+                                mainBranch.BranchingPoint = null;
+                                _branchTips["main"] = mainBranch;
+                                mainBranch.Id = changeSet.Id;
+                                _lastId++;
+                                changeSet.Id = _lastId;
+                                orderedChangeSets.Insert(orderedChangeSets.Count - 1, mainBranch);
+                                _elementsNamesByBranch.Add("main", new Dictionary<Element, HashSet<string>>());
+                                _elementsVersionsByBranch.Add("main", new Dictionary<Element, ElementVersion>());
+                                _startedBranches.Add("main", null);
                             }
                             if (toStart != null)
                             {
@@ -221,8 +413,11 @@ namespace GitImporter
                     var lostVersion = orphanedVersion.Item2.Version;
                     lostVersions.Add(lostVersion);
                     labeledOrphans.Remove(lostVersion);
-                    Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet,
+                    if (insideRoot(lostVersion.Element))
+                    {
+                        Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet,
                                      "Version " + lostVersion + " has not been visible in any imported directory version");
+                    }
                 }
 
             // now that we now what versions to ignore :
@@ -273,7 +468,7 @@ namespace GitImporter
                 _flattenChangeSets[_currentIndex++] = null;
                 return new[] { changeSet };
             }
-            // we look for a label that could be completed with changeSets within the next four hours
+            // we look for a label that could be completed with changeSets within the next hours
             foreach (var pair in wouldBreakLabels)
             {
                 int index = _currentIndex;
@@ -296,13 +491,25 @@ namespace GitImporter
                 // versions on parent branch are OK (else we would already have failed),
                 // versions on children branches will be handled later (when the branch spawns)
                 missingVersions = new HashSet<ElementVersion>(missingVersions);
-                var lastVersion = missingVersions.OrderBy(v => v.Date.Ticks).Last();
-                if ((lastVersion.Date - changeSet.FinishTime).TotalHours > 4.0)
+                var missing = new HashSet<ElementVersion>(missingVersions);
+                while (true)
                 {
-                    Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet,
-                        string.Format("Label {0} broken at {1}, missing version {2} ({3}) is too late : not applied", label, changeSet, lastVersion, lastVersion.Date));
-                    _labels.Remove(label);
-                    continue;
+                    ElementVersion lastVersion = missing.OrderBy(v => v.Date.Ticks).Last();
+                    if (changeSet.FinishTime.AddHours(8.0) < lastVersion.Date && _labelMetas[label].Created.AddHours(8.0) < lastVersion.Date)
+                    {
+                        Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet,
+                            string.Format("Label {0} broken at {1}, {4} versions including {2} ({3}) is too late : will drop that version and try to continue", label, changeSet, lastVersion, lastVersion.Date, missing.Count));
+                        _labels[label].Versions.Remove(lastVersion);
+                        _labels[label].MissingVersions.RemoveFromCollection(lastVersion.Branch.BranchName, lastVersion);
+                        _allLabels[label].PossiblyBroken.Add(Tuple.Create(lastVersion, (ElementVersion)null));
+                        missing.Remove(lastVersion);
+                        if (missing.Count() == 0)
+                        {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
                 var neededChangeSets = new HashSet<int>();
                 while (missingVersions.Count > 0 && index < _flattenChangeSets.Count)
@@ -318,15 +525,19 @@ namespace GitImporter
                         }
                 }
                 if (missingVersions.Count > 0)
-                    throw new Exception("Label " + label + " could not be completed : versions " +
-                        string.Join(", ", missingVersions.Select(v => v.ToString())) + " not in any further ChangeSet on branch " + changeSet.Branch);
+                {
+                   string msg = "Label " + label + " broken because it could not be completed : versions " +
+                        string.Join(", ", missingVersions.Select(v => v.ToString())) + " not in any further ChangeSet on branch " + changeSet.Branch +
+                        ". Will try to force the versions anyway!";
+                    Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet, msg);
+                    _labels.Remove(label);
+                    continue;
+                }
 
                 bool isLabelConsistent = ProcessDependenciesAndCheckLabelConsistency(neededChangeSets, label, index);
                 if (!isLabelConsistent)
                 {
-                    Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet, "Label " + label + " broken at " + changeSet + " : not applied");
-                    _labels.Remove(label);
-                    continue;
+                    Logger.TraceData(TraceEventType.Information, (int)TraceId.CreateChangeSet, "Label " + label + " inconsistent at " + changeSet + " : force applying anyway");
                 }
                 // everything is OK : applying all neededChangeSets will complete label for this branch
                 var result = new List<ChangeSet>();
@@ -471,7 +682,7 @@ namespace GitImporter
             {
                 // we should usually not complete a label here : the version of the parent directory with the label should not have been seen
                 // this can still happen if the version only appears in directories not imported (meaning they will be reported in "really lost versions")
-                changeSet.Labels.AddRange(ProcessVersionLabels(version, elementsVersions, finishedLabels));
+                changeSet.Labels.AddRange(ProcessVersionLabels(changeSet, version, elementsVersions, finishedLabels));
                 if (finishedLabels.Count > 0)
                 {
                     labeledOrphans.Add(version);
@@ -479,11 +690,11 @@ namespace GitImporter
                                      "Label(s) " + string.Join(", ", finishedLabels) + " has been completed with orphan version " + version);
                 }
             }
-            foreach (var namedVersion in changeSet.Versions)
-                changeSet.Labels.AddRange(ProcessVersionLabels(namedVersion.Version, elementsVersions, finishedLabels));
+            foreach (var namedVersion in changeSet.Versions.ToList())
+                changeSet.Labels.AddRange(ProcessVersionLabels(changeSet, namedVersion.Version, elementsVersions, finishedLabels));
         }
 
-        private IEnumerable<string> ProcessVersionLabels(ElementVersion version, Dictionary<Element, ElementVersion> elementsVersions, HashSet<string> finishedLabels)
+        private IEnumerable<string> ProcessVersionLabels(ChangeSet changeSet, ElementVersion version, Dictionary<Element, ElementVersion> elementsVersions, HashSet<string> finishedLabels)
         {
             var result = new List<string>();
             foreach (var label in version.Labels)
@@ -506,14 +717,29 @@ namespace GitImporter
                     if ((inCurrentVersions == null && toCheck.VersionNumber != 0) ||
                         (inCurrentVersions != null && inCurrentVersions != toCheck))
                     {
-                        string msg = "Label " + label + " is inconsistent : should be on " + toCheck +
-                            (inCurrentVersions == null ? ", but element has no current version" : ", not on " + inCurrentVersions);
-                        Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet, msg);
+                        if (inCurrentVersions != null && inCurrentVersions.VersionNumber == 0)
+                        {
+                            string msg = "Label " + label + " is inconsistent : removing element that should be on " + toCheck +
+                                ", not on " + inCurrentVersions;
+                            Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet, msg);
+                            _allLabels[label].Versions.Remove(inCurrentVersions);
+                            changeSet.Versions.RemoveAll(named => named.Version.VersionPath == inCurrentVersions.VersionPath);
+                        }
+                        else
+                        {
+                            string msg = "Label " + label + " is inconsistent : should be on " + toCheck +
+                                (inCurrentVersions == null ? ", but element has no current version" : ", not on " + inCurrentVersions);
+                            Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet, msg);
+                        }
+                        _allLabels[label].PossiblyBroken.Add(Tuple.Create(toCheck, inCurrentVersions));
                         ok = false;
                     }
                 }
                 if (!ok)
-                    Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet, "Label " + label + " was inconsistent : not applied");
+                {
+                    Logger.TraceData(TraceEventType.Information, (int)TraceId.CreateChangeSet, "Label " + label + " was inconsistent, but will force apply anyway");
+                    result.Add(label);
+                }
                 else
                 {
                     Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet, "Label " + label + " was applied");
@@ -628,13 +854,17 @@ namespace GitImporter
             foreach (var fromChangeSet in changeSet.Merges.Where(c => source[c.Id - startingId] != null))
             {
                 Logger.TraceData(TraceEventType.Information, (int)TraceId.CreateChangeSet,
-                    "Reordering : ChangeSet " + fromChangeSet + "  must be imported before " + changeSet);
+                    "Reordering : ChangeSet " + fromChangeSet + " must be imported before because of merge into " + changeSet);
                 if (fromChangeSet != source[fromChangeSet.Id - startingId])
                     throw new Exception("Inconsistent Id for " + fromChangeSet +
                         " : changeSet at corresponding index was " + (source[fromChangeSet.Id - startingId] == null ? "null" : source[fromChangeSet.Id - startingId].ToString()));
                 for (int i = firstNonNullIndex; i <= fromChangeSet.Id - startingId; i++)
+                {
                     if (source[i] != null && source[i].Branch == fromChangeSet.Branch)
+                    {
                         AddChangeSet(source, destination, i, startingId, firstNonNullIndex);
+                    }
+                }
             }
 
             destination.Add(changeSet);

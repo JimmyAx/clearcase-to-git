@@ -51,7 +51,7 @@ namespace GitImporter
                 file = file.Substring(pos + 1);
             }
             Logger.TraceData(TraceEventType.Start | TraceEventType.Information, (int)TraceId.ReadExport, "Start reading export file", file);
-            TextReader reader = new StreamReader(file);
+            TextReader reader = new StreamReader(file, Encoding.Default);
             string line;
             string currentElementName = null;
             Element currentElement = null;

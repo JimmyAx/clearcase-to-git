@@ -59,8 +59,6 @@ namespace GitImporter
                     // do not consider version 0 as orphaned (meaningful only on "main", but we don't include branches' versions 0)
                     if (namedVersion.Version.VersionNumber == 0)
                         continue;
-                    Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet,
-                        "Version " + namedVersion.Version + " was not yet visible in an existing directory version");
                     _orphanedVersionsByElement.AddToCollection(namedVersion.Version.Element,
                         new Tuple<string, ChangeSet.NamedVersion>(_changeSet.Branch, namedVersion));
                     // do not keep it in _changeSet.Versions : maybe the name that will be given clashes with an existing one
@@ -180,12 +178,39 @@ namespace GitImporter
 
                     var namedInElement = new Tuple<Element, string>(version.Element, pair.Key);
                     if (!addedElements.RemoveFromCollection(childElement, namedInElement))
+                    {
                         removedElements.AddToCollection(childElement, namedInElement);
+                    }
                 }
             foreach (var pair in version.Content)
             {
                 if (previousVersion == null || !previousVersion.Content.Any(p => p.Key == pair.Key && p.Value == pair.Value))
+                {
                     addedElements.AddToCollection(pair.Value, new Tuple<Element, string>(version.Element, pair.Key));
+                }
+            }
+
+            foreach(var pair in addedElements)
+            {
+                if (!removedElements.Any(p => p.Key.Oid == pair.Key.Oid))
+                {
+                    continue;
+                }
+                List<Tuple<Element, string>> added = pair.Value;
+                List<Tuple<Element, string>> removed = removedElements.Find(p => p.Key.Oid == pair.Key.Oid).Value;
+                for (int i = added.Count - 1; i >= 0; i--)
+                {
+                    Tuple<Element, string> a = added[i];
+                    Tuple<Element, string> matching = removed.Find(r => r.Item1.Oid == a.Item1.Oid && r.Item2 == a.Item2);
+                    if (matching != null && previousVersion != null && !previousVersion.Content.Any(p => p.Value == matching.Item1))
+                    {
+                        Logger.TraceData(TraceEventType.Warning, (int)TraceId.CreateChangeSet,
+                            "Erasing added and at the same time removed version", matching.Item1, matching.Item2);
+                        added.RemoveAt(i);
+                        removed.Remove(matching);
+                        _changeSet.Versions.RemoveAll(v => v.Version.Element.Oid == matching.Item1.Oid); // TODO: Oid -> Name?
+                    }
+                }
             }
         }
 
@@ -226,16 +251,8 @@ namespace GitImporter
                         string elementName = parentElementName + "/" + namedInElement.Item2;
 
                         // git doesn't handle empty directories...
-                        if (!WasEmptyDirectory(pair.Key))
-                        {
-                            if (isRenamed)
-                            {
-                                result.Add(new KeyValuePair<Element, string>(pair.Key, elementName));
-                                isRenamed = false;
-                            }
-                            // maybe one of its parent has already been removed
-                            else if (!_changeSet.Removed.Any(removed => elementName.StartsWith(removed + "/")))
-                                _changeSet.Removed.Add(elementName);
+                        if (!WasEmptyDirectory(pair.Key) && !_changeSet.Removed.Any(removed => elementName.StartsWith(removed + "/")))
+                            _changeSet.Removed.Add(elementName);
                         }
                         // not available anymore
                         RemoveElementName(pair.Key, elementName, removedElementsNames);
@@ -296,6 +313,8 @@ namespace GitImporter
 
                 foreach (var newName in addedElements[index].Value)
                 {
+                    Logger.TraceData(TraceEventType.Information, (int)TraceId.CreateChangeSet,
+                        "Known renamed element", renamedElement, "with old name", oldName, "to new name", newName);
                     HashSet<string> elementNames;
                     if (_elementsNames.TryGetValue(newName.Item1, out elementNames))
                     {
@@ -310,13 +329,17 @@ namespace GitImporter
                                 {
                                     var rename = _changeSet.Renamed[i];
                                     if (rename.Item2.StartsWith(target + "/"))
+                                    {
                                         _changeSet.Renamed[i] = new Tuple<string, string>(rename.Item1, oldName + "/" + rename.Item2.Substring(target.Length + 1));
+                                    }
                                 }
                                 for (int i = 0; i < _changeSet.Copied.Count; i++)
                                 {
                                     var copy = _changeSet.Copied[i];
                                     if (copy.Item2.StartsWith(target + "/"))
+                                    {
                                         _changeSet.Renamed[i] = new Tuple<string, string>(copy.Item1, oldName + "/" + copy.Item2.Substring(target.Length + 1));
+                                    }
                                 }
 
                                 // actual rename or copy
@@ -326,10 +349,13 @@ namespace GitImporter
                                     if (conflictingRename != -1)
                                     {
                                         if (_changeSet.Renamed[conflictingRename].Item1 != renamedTo)
+                                        {
                                             // then simply do this rename before
                                             _changeSet.Renamed.Insert(conflictingRename, new Tuple<string, string>(oldName, renamedTo));
+                                        }
                                         else
                                         {
+                                            // then simply do this rename before
                                             // somebedy was perverse enough to exchange the names !
                                             var tmpName = oldName + "." + Guid.NewGuid();
                                             _changeSet.Renamed[conflictingRename] = new Tuple<string, string>(renamedTo, tmpName);
@@ -338,10 +364,15 @@ namespace GitImporter
                                         }
                                     }
                                     else
+                                    {
+                                        // then simply do this rename before
                                         _changeSet.Renamed.Add(new Tuple<string, string>(oldName, renamedTo));
+                                    }
                                 }
                                 else
+                                {
                                     _changeSet.Copied.Add(new Tuple<string, string>(renamedTo, target));
+                                }
                                 
                                 // it may happen that there was another element with the destination name that was removed (not renamed)
                                 // in this case the Remove would instead wrongly apply to the renamed or copied element,
@@ -365,9 +396,10 @@ namespace GitImporter
                 return;
             }
             ElementVersion currentVersion;
-            if (!_elementsVersions.TryGetValue(element, out currentVersion))
+            if (!_elementsVersions.TryGetValue(element, out currentVersion)) {
                 // assumed to be (empty) version 0
                 return;
+            }
 
             if (element.IsDirectory)
             {
@@ -407,9 +439,10 @@ namespace GitImporter
 
             // we've got a name here, maybe some orphans just found their parent ?
             List<Tuple<string, ChangeSet.NamedVersion>> orphanedVersions;
-            if (!_orphanedVersionsByElement.TryGetValue(element, out orphanedVersions))
+            if (!_orphanedVersionsByElement.TryGetValue(element, out orphanedVersions)) {
                 // no, no orphan to happily return to their family
                 return;
+            }
 
             foreach (var namedVersion in orphanedVersions.ToList())
                 if (namedVersion.Item1 == _changeSet.Branch && namedVersion.Item2.Version == currentVersion)

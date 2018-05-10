@@ -39,7 +39,7 @@ namespace GitImporter
             }
         }
 
-        public class Comparer : IComparer<ChangeSet>
+        public class TimeComparer : IComparer<ChangeSet>
         {
             public int Compare(ChangeSet x, ChangeSet y)
             {
@@ -82,9 +82,36 @@ namespace GitImporter
             get
             {
                 return Versions.Where(v => !v.Version.Element.IsDirectory && v.Names.Count > 0).Count() == 0 &&
-                    Renamed.Count == 0 && Removed.Count == 0 && Copied.Count == 0 &&
-                    SymLinks.Count == 0 && Labels.Count == 0 && !IsBranchingPoint &&
-                    BranchingPoint == null && Merges.Count == 0 && !IsMerged;
+                    Renamed.Count == 0 &&
+                    Removed.Count == 0 &&
+                    Copied.Count == 0 &&
+                    SymLinks.Count == 0 &&
+                    Labels.Count == 0 &&
+                    !IsBranchingPoint &&
+                    BranchingPoint == null &&
+                    Merges.Count == 0 &&
+                    !IsMerged;
+            }
+        }
+
+        public bool IsEmptyGitCommit
+        {
+            get
+            {
+                return Merges.Count == 0 &&
+                    Renamed.Count == 0 &&
+                    Copied.Count == 0 &&
+                    Removed.Count == 0 &&
+                    SymLinks.Count == 0 &&
+                    Versions.Where(v => !v.Version.Element.IsDirectory && v.Names.Count > 0).Count() == 0;
+            }
+        }
+
+        public bool IsUselessGitCommit
+        {
+            get
+            {
+                return IsEmptyGitCommit && Labels.Count == 0;
             }
         }
 
@@ -139,8 +166,9 @@ namespace GitImporter
                     SkippedVersions.Add(skippedVersion);
                 result = existing;
             }
-            else
+            else {
                 Versions.Add(result = new NamedVersion(version, name, inRawChangeSet));
+            }
             if (inRawChangeSet)
             {
                 if (version.Date < StartTime)
@@ -152,12 +180,16 @@ namespace GitImporter
             return result;
         }
 
+        public int VersionsCount()
+        {
+            return Versions.Where(v => !v.InRawChangeSet && v.Names.Count > 0 && !v.Version.Element.IsDirectory).Count();
+        }
+
         public string GetComment()
         {
             var interestingFileChanges = Versions.Where(v => v.InRawChangeSet && v.Names.Count > 0 && !v.Version.Element.IsDirectory).ToList();
             int nbFileChanges = interestingFileChanges.Count;
-            int nbTreeChanges = Removed.Count + Renamed.Count + Copied.Count + SymLinks.Count +
-                Versions.Where(v => !v.InRawChangeSet && v.Names.Count > 0 && !v.Version.Element.IsDirectory).Count();
+            int nbTreeChanges = Removed.Count + Renamed.Count + Copied.Count + SymLinks.Count + VersionsCount();
             if (nbFileChanges == 0)
                 return nbTreeChanges > 0 ? nbTreeChanges + " tree modification" + (nbTreeChanges > 1 ? "s" : "") : "No actual change";
 
@@ -175,7 +207,7 @@ namespace GitImporter
                 title = string.Format("{0} file modification{1}", nbFileChanges, (nbFileChanges > 1 ? "s" : ""));
 
             if (allComments.Count == 0)
-                return title + " : " + DisplayFileNames(interestingFileChanges.Select(v => v.Names[0]).ToList(), false);
+                return title + ": " + DisplayFileNames(interestingFileChanges.Select(v => v.Names[0]).ToList(), false);
 
             var mostFrequentComment = allComments.First();
             // no multi-line comment as title
@@ -184,7 +216,7 @@ namespace GitImporter
                 title = mostFrequentComment.Key + " (" + title + ")";
 
             if (useMostFrequentCommentAsTitle && allComments.Count == 1)
-                return title + " : " + DisplayFileNames(interestingFileChanges.Select(v => v.Names[0]).ToList(), false);
+                return title + ": " + DisplayFileNames(interestingFileChanges.Select(v => v.Names[0]).ToList(), false);
 
             var sb = new StringBuilder(title);
             sb.Append("\n");
@@ -192,7 +224,7 @@ namespace GitImporter
             {
                 sb.Append("\n");
                 sb.Append(DisplayFileNames(comment.Value, true));
-                sb.Append(" :\n\t");
+                sb.Append(":\n\t");
                 sb.Append(comment.Key.Replace("\n", "\n\t"));
             }
 

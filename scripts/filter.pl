@@ -29,5 +29,5 @@ foreach $pattern (@patterns) {
 
 next if $skip;
 
-s/.*\\MyVob\\//;
+#s/.*\\MyVob\\//;
 print

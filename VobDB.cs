@@ -12,9 +12,10 @@ namespace GitImporter
     {
         public Dictionary<string, Element> ElementsByOid { get; private set; }
 
-        public VobDB(Dictionary<string, Element> elementsByOid)
+        public VobDB(Dictionary<string, Element> elementsByOid, Dictionary<string, LabelMeta> labelMetas)
         {
             ElementsByOid = elementsByOid;
+            LabelMetas = labelMetas;
         }
 
         public VobDB()
@@ -41,6 +42,8 @@ namespace GitImporter
 
         [ProtoMember(1)]
         private List<Element> _rawElements;
+        [ProtoMember(2)]
+        public Dictionary<string, LabelMeta> LabelMetas { get; private set; }
 
         [ProtoBeforeSerialization]
         private void BeforeProtobufSerialization()

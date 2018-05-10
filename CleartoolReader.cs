@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
@@ -25,6 +26,8 @@ namespace GitImporter
         private readonly List<Tuple<DirectoryVersion, string, string>> _contentFixups = new List<Tuple<DirectoryVersion, string, string>>();
         private readonly List<Tuple<ElementVersion, string, int, bool>> _mergeFixups = new List<Tuple<ElementVersion, string, int, bool>>();
 
+        private readonly Dictionary<string, LabelMeta> _labelMetas = new Dictionary<string, LabelMeta>();
+
         public CleartoolReader(string clearcaseRoot, string originDate, IEnumerable<string> labels)
         {
             var labelFilter = new LabelFilter(labels);
@@ -35,7 +38,7 @@ namespace GitImporter
             _originDate = string.IsNullOrEmpty(originDate) ? DateTime.UtcNow : DateTime.Parse(originDate).ToUniversalTime();
         }
 
-        public VobDB VobDB { get { return new VobDB(ElementsByOid); } }
+        public VobDB VobDB { get { return new VobDB(ElementsByOid, _labelMetas); } }
 
         internal void Init(VobDB vobDB, IEnumerable<Element> elements)
         {
@@ -79,7 +82,7 @@ namespace GitImporter
             {
                 Logger.TraceData(TraceEventType.Start | TraceEventType.Information, (int)TraceId.ReadCleartool, "Start reading file elements", elementsFile);
                 var allActions = new List<Action>();
-                using (var files = new StreamReader(elementsFile))
+                using (var files = new StreamReader(elementsFile, Encoding.Default))
                 {
                     string line;
                     int i = 0;
@@ -103,7 +106,7 @@ namespace GitImporter
             {
                 Logger.TraceData(TraceEventType.Start | TraceEventType.Information, (int)TraceId.ReadCleartool, "Start reading directory elements", directoriesFile);
                 var allActions = new List<Action>();
-                using (var directories = new StreamReader(directoriesFile))
+                using (var directories = new StreamReader(directoriesFile, Encoding.Default))
                 {
                     string line;
                     int i = 0;
@@ -182,6 +185,41 @@ namespace GitImporter
                 (fixup.Item4 ? toFix.MergesTo : toFix.MergesFrom).Add(linkTo);
             }
             Logger.TraceData(TraceEventType.Stop | TraceEventType.Information, (int)TraceId.ReadCleartool, "Stop fixups");
+
+            Logger.TraceData(TraceEventType.Start | TraceEventType.Information, (int)TraceId.ReadCleartool, "Start reading label meta info");
+            var labelActions = new List<Action>();
+            int task = 0;
+            List<string> labels;
+            lock (_cleartools[0])
+                labels = _cleartools[0].ListLabels();
+            foreach (var label in labels)
+            {
+                int iTask = ++task;
+                labelActions.Add(() =>
+                    {
+                        if (iTask % 100 == 0)
+                            Logger.TraceData(TraceEventType.Information, (int)TraceId.ReadCleartool, "Reading label meta info " + iTask);
+                        string author;
+                        string login;
+                        DateTime date;
+
+                        var cleartool = _cleartools[task % _nbCleartool];
+                        lock (cleartool)
+                            cleartool.GetLabelDetails(label, out author, out login, out date);
+
+                        LabelMeta labelMeta = new LabelMeta();
+                        labelMeta.Name = label;
+                        labelMeta.AuthorName = author;
+                        labelMeta.AuthorLogin = login;
+                        labelMeta.Created = date;
+
+                        lock (_labelMetas)
+                            _labelMetas[label] = labelMeta;
+                });
+            }
+            Parallel.Invoke(new ParallelOptions { MaxDegreeOfParallelism = _nbCleartool * 2 }, labelActions.ToArray());
+            Logger.TraceData(TraceEventType.Stop | TraceEventType.Information, (int)TraceId.ReadCleartool, "Stop reading label meta info");
+
             return result;
         }
 
@@ -226,8 +264,35 @@ namespace GitImporter
                 {
                     // a new branch always start from the last seen version of the parent branch
                     ElementVersion branchingPoint = null;
-                    if (versionPath.Length > 2)
-                        branchingPoint = element.Branches[versionPath[versionPath.Length - 3]].Versions.Last();
+                    if (versionPath.Length > 2) {
+                        // The version could be missing on a parent branch because
+                        // it was created (or merged) directly from a grandparent.
+                        // We need to traverse the whole branch tree up to the main
+                        // branch to find any.
+                        int index = versionPath.Length - 3;
+                        while (index >= 0) {
+                            string b = versionPath[index];
+                            if (element.Branches.ContainsKey(b)) {
+                                branchingPoint = element.Branches[b].Versions.Last();
+                                break;
+                            }
+                            index--;
+                        }
+                        if (branchingPoint == null) {
+                            throw new Exception("Unable to find any branching point for version " + versionString + " and element " + elementName + "!");
+                        }
+                        // Go back up to the missing one
+                        while (index < versionPath.Length - 3) {
+                            index++;
+                            string skippedName = versionPath[index];
+                            ElementBranch skippedBranch = new ElementBranch(element, skippedName, branchingPoint);
+                            element.Branches[skippedName] = skippedBranch;
+                            if (!AddVersionToBranch(skippedBranch, 0, isDir, null, cleartool)) {
+                                throw new Exception("Failed to add missing branch " + skippedName + " for element " + elementName + "!");
+                            }
+                            branchingPoint = skippedBranch.Versions.Last();
+                        }
+                    }
                     branch = new ElementBranch(element, branchName, branchingPoint);
                     element.Branches[branchName] = branch;
                 }

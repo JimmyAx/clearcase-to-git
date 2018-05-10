@@ -2,8 +2,10 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Threading;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace GitImporter
@@ -17,6 +19,7 @@ namespace GitImporter
         private readonly Process _process;
         private readonly Thread _outputThread;
         private readonly Thread _errorThread;
+        private readonly StreamWriter _inputWriter;
         private readonly ManualResetEventSlim _cleartoolAvailable = new ManualResetEventSlim();
         private readonly string _clearcaseRoot;
         private readonly LabelFilter _labelFilter;
@@ -40,6 +43,7 @@ namespace GitImporter
                             { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
             _process = new Process { StartInfo = startInfo };
             _process.Start();
+            _inputWriter = new StreamWriter(_process.StandardInput.BaseStream, Encoding.Default) { AutoFlush = true };
             _outputThread = new Thread(ReadOutput) { IsBackground = true };
             _outputThread.Start();
             _errorThread = new Thread(ReadError) { IsBackground = true };
@@ -107,7 +111,7 @@ namespace GitImporter
                 _cleartoolAvailable.Reset();
                 _lastError = null;
                 _currentOutput = new List<string>();
-                _process.StandardInput.WriteLine(cmd);
+                _inputWriter.WriteLine(cmd);
                 _cleartoolAvailable.Wait();
                 Logger.TraceData(TraceEventType.Stop | TraceEventType.Verbose, (int)TraceId.Cleartool, "Stop executing cleartool command", cmd);
                 if (_lastError != null)
@@ -191,19 +195,23 @@ namespace GitImporter
         {
             bool isDir = version.Element.IsDirectory;
             // not interested in directory merges
-            string format = "%Fu" + _separator + "%u" + _separator + "%Nd" + _separator + "%Nc" + _separator + "%Nl" +
+            string format = "%Fu" + _separator + "%u" + _separator + "%d" + _separator + "%Nc" + _separator + "%Nl" +
                 (isDir ? "" : _separator + "%[hlink:Merge]p");
             // string.Join to handle multi-line comments
             string raw = string.Join("\r\n", ExecuteCommand("desc -fmt \"" + format + "\" \"" + version + "\""));
             string[] parts = _separator.Split(raw);
             version.AuthorName = string.Intern(parts[0]);
             version.AuthorLogin = string.Intern(parts[1]);
-            version.Date = DateTime.ParseExact(parts[2], "yyyyMMdd.HHmmss", null).ToUniversalTime();
+            version.Date = DateTime.Parse(parts[2], null, DateTimeStyles.RoundtripKind).ToUniversalTime();
             version.Comment = string.Intern(parts[3]);
             foreach (string label in parts[4].Split(' '))
                 if (!string.IsNullOrWhiteSpace(label) && _labelFilter.ShouldKeep(label))
                     version.Labels.Add(string.Intern(label));
             mergesTo = mergesFrom = null;
+            if (isDir && parts.Count() >= 6 && !string.IsNullOrEmpty(parts[5]))
+            {
+                Logger.TraceData(TraceEventType.Verbose, (int)TraceId.Cleartool, "Ignoring directory merge info for", version);
+            }
             if (isDir || string.IsNullOrEmpty(parts[5]))
                 return;
 
@@ -227,6 +235,23 @@ namespace GitImporter
             }
         }
 
+        public List<string> ListLabels()
+        {
+            return ExecuteCommand("lstype -kind lbtype -obsolete -fmt \"%n\\r\\n\"").Select(s => s.Trim()).ToList();
+        }
+
+        public void GetLabelDetails(string label, out string authorName, out string login, out DateTime date)
+        {
+            string format = "%Fu" + _separator + "%u" + _separator + "%d";
+            // string.Join to handle multi-line comments
+            string raw = string.Join("\r\n", ExecuteCommand("desc -fmt \"" + format + "\" \"lbtype:" + label + "\""));
+            string[] parts = _separator.Split(raw);
+            authorName = string.Intern(parts[0]);
+            login = string.Intern(parts[1]);
+            //date = DateTime.ParseExact(parts[2], "yyyyMMdd.HHmmss", null).ToUniversalTime();
+            date = DateTime.Parse(parts[2], null, DateTimeStyles.RoundtripKind).ToUniversalTime();
+        }
+
         public string Get(string element)
         {
             string tmp = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -248,7 +273,7 @@ namespace GitImporter
 
         public void Dispose()
         {
-            _process.StandardInput.WriteLine("quit");
+            _inputWriter.WriteLine("quit");
             _outputThread.Join();
             _errorThread.Join();
             _process.Close();

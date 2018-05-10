@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.IO;
 using System.Text.RegularExpressions;
 
 namespace GitImporter
@@ -11,8 +12,8 @@ namespace GitImporter
     {
         public static TraceSource Logger = Program.Logger;
 
-        private const int MAX_DELAY = 20;
-        private static readonly ChangeSet.Comparer _comparer = new ChangeSet.Comparer();
+        private const int MAX_DELAY = 60 * 30;
+        private static readonly ChangeSet.TimeComparer _timeComparer = new ChangeSet.TimeComparer();
 
         private readonly Dictionary<string, Element> _elementsByOid;
         private List<Regex> _branchFilters;
@@ -27,11 +28,33 @@ namespace GitImporter
 
         public Dictionary<string, LabelInfo> Labels { get; private set; }
 
+        public HashSet<string> Roots { get; set; }
+
+        public List<string> RelativeRoots { get; set; }
+
+        public string ClearcaseRoot { get; set; }
+
+
         public RawHistoryBuilder(VobDB vobDB)
         {
             if (vobDB != null)
                 _elementsByOid = vobDB.ElementsByOid;
             Labels = new Dictionary<string, LabelInfo>();
+        }
+
+        public void SetClearcaseRoot(string root)
+        {
+            ClearcaseRoot = root.Replace("\\", "/");
+        }
+
+        public void SetRoots(HashSet<string> roots)
+        {
+            Roots = roots;
+        }
+
+        public void SetRelativeRoots(List<string> roots)
+        {
+            RelativeRoots = roots;
         }
 
         public void SetBranchFilters(string[] branches)
@@ -46,7 +69,23 @@ namespace GitImporter
             ComputeGlobalBranches(allElementBranches);
             FilterBranches();
             FilterLabels();
-            return _changeSets.Values.SelectMany(d => d.Values.SelectMany(l => l)).OrderBy(c => c, _comparer).ToList();
+            List<ChangeSet> changes = _changeSets.Values.SelectMany(d => d.Values.SelectMany(l => l)).ToList();
+            Logger.TraceData(TraceEventType.Start | TraceEventType.Information, (int)TraceId.CreateChangeSet, "Start sorting raw ChangeSets of size", changes.Count);
+            changes.Sort(_timeComparer);
+            Logger.TraceData(TraceEventType.Stop | TraceEventType.Information, (int)TraceId.CreateChangeSet, "Stop sorting raw ChangeSets");
+            return changes;
+        }
+
+        private string RemoveDotRoot(string path)
+        {
+            if (path.StartsWith(ClearcaseRoot))
+            {
+                path = path.Substring(ClearcaseRoot.Length);
+            }
+            if (path.StartsWith("/")) {
+                path = path.Substring(1);
+            }
+            return path.StartsWith("./") ? path.Substring(2) : path;
         }
 
         private IEnumerable<string> CreateRawChangeSets(IEnumerable<ElementVersion> newVersions)
@@ -63,6 +102,11 @@ namespace GitImporter
                 var allNewVersions = new HashSet<ElementVersion>(newVersions);
                 foreach (var version in newVersions)
                 {
+                    if (!insideRoot(version.Element)) 
+                    {
+                        Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet, "Skipping version not inside root", version);
+                        continue;
+                    }
                     allElementBranches.Add(version.Branch.FullName);
                     Dictionary<string, List<ChangeSet>> branchChangeSets;
                     if (!_changeSets.TryGetValue(version.Branch.BranchName, out branchChangeSets))
@@ -76,6 +120,12 @@ namespace GitImporter
             else
             {
                 foreach (var element in _elementsByOid.Values)
+                {
+                    if (!insideRoot(element)) 
+                    {
+                        Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet, "Skipping element not inside root", element);
+                        continue;
+                    }
                     foreach (var branch in element.Branches.Values)
                     {
                         allElementBranches.Add(branch.FullName);
@@ -88,10 +138,39 @@ namespace GitImporter
                         foreach (var version in branch.Versions)
                             ProcessVersion(version, branchChangeSets, null);
                     }
+                }
             }
 
             Logger.TraceData(TraceEventType.Stop | TraceEventType.Information, (int)TraceId.CreateChangeSet, "Stop creating raw ChangeSets");
             return allElementBranches;
+        }
+
+        private bool insideRoot(Element element)
+        {
+            var name = element.Name.Replace("\\", "/");
+            string normalizedName;
+            if (name.StartsWith(ClearcaseRoot + "/.@@/main/"))
+            {
+                // hidden. take special care
+                name = name.Substring((ClearcaseRoot + "/.@@/main/").Length);
+                var match = Regex.Match(name, "([0-9]+?)/([^0-9/]+)");
+                if (!match.Success)
+                {
+                    throw new Exception("Failed find version for " + element.Name);
+                }
+                normalizedName = match.Groups[2].Value + "/";
+            }
+            else
+            {
+                // visible. nothing special here
+                normalizedName = RemoveDotRoot(name);
+            }
+            return null != RelativeRoots.Find(
+                r =>  {
+                    Logger.TraceData(TraceEventType.Verbose, (int)TraceId.CreateChangeSet, "Comparing in raw", normalizedName, "vs", r);
+                    return normalizedName == "." || normalizedName == r || normalizedName.StartsWith(r + "/") || normalizedName.StartsWith(r + "@@/");
+                }
+            );
         }
 
         private void ProcessVersion(ElementVersion version, Dictionary<string, List<ChangeSet>> branchChangeSets, HashSet<ElementVersion> newVersions)
@@ -142,7 +221,7 @@ namespace GitImporter
                 return;
             }
 
-            int index = changeSets.BinarySearch(changeSet, _comparer);
+            int index = changeSets.BinarySearch(changeSet, _timeComparer);
             if (index >= 0)
             {
                 changeSets[index].Add(version);
@@ -305,9 +384,13 @@ namespace GitImporter
 
         private void FilterBranches()
         {
-            if (_branchFilters == null || _branchFilters.Count == 0)
-                return;
-            var branchesToRemove = new HashSet<string>(GlobalBranches.Keys.Where(b => b != "main" && !_branchFilters.Exists(r => r.IsMatch(b))));
+            var relativeRoots = computeRelativeRoots();
+            var branchesToRemove = new HashSet<string>();
+
+            if (_branchFilters != null && _branchFilters.Count != 0)
+            {
+                branchesToRemove.UnionWith(GlobalBranches.Keys.Where(b => b != "main" && !_branchFilters.Exists(r => r.IsMatch(b))));
+            }
             bool finished = false;
             while (!finished)
             {
@@ -336,8 +419,54 @@ namespace GitImporter
                 Logger.TraceData(TraceEventType.Information, (int)TraceId.CreateChangeSet, "Label " + toRemove + " filtered : was on a filtered out branch");
                 Labels.Remove(toRemove);
             }
+
+            var relativeRoots = computeRelativeRoots();
+            labelsToRemove = Labels.Values
+                .Where(l => {
+                    // only filter this label if all the versions are not in a root
+                    return null == l.Versions.Find(v => {
+                        int count = relativeRoots.Where(r => {
+                            string name = v.Element.Name;
+                            if (name.StartsWith(ClearcaseRoot))
+                            {
+                                name = name.Substring(ClearcaseRoot.Length);
+                            }
+                            if (name.StartsWith("\\"))
+                            {
+                                name = name.Substring(1);
+                            }
+                            return name.StartsWith(r);
+                        }).Count();
+                        if (count > 1) {
+                            // sanity check
+                            throw new Exception("ambiguous roots for " + v);
+                        }
+                        return count == 1;
+                    });
+                })
+                .Select(l => l.Name).ToList();
+            foreach (var toRemove in labelsToRemove)
+            {
+                Logger.TraceData(TraceEventType.Information, (int)TraceId.CreateChangeSet, "Label " + toRemove + " filtered : not used in any root");
+                Labels.Remove(toRemove);
+            }
+
             foreach (var label in Labels.Values)
                 label.Reset();
+        }
+
+        private List<string> computeRelativeRoots()
+        {
+            return Roots.Where(r => r != ".").Select(r => {
+                if (r.StartsWith(ClearcaseRoot)) {
+                    r = r.Substring(ClearcaseRoot.Length);
+                }
+                if (r.StartsWith("\\"))
+                {
+                    r = r.Substring(1);
+                }
+                return r;
+            }).ToList();
         }
     }
 }
