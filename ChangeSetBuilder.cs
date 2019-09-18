@@ -253,7 +253,7 @@ namespace GitImporter
                         // git doesn't handle empty directories...
                         if (!WasEmptyDirectory(pair.Key) && !_changeSet.Removed.Any(removed => elementName.StartsWith(removed + "/")))
                             _changeSet.Removed.Add(elementName);
-                        }
+
                         // not available anymore
                         RemoveElementName(pair.Key, elementName, removedElementsNames);
                     }
